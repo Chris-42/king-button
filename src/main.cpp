@@ -100,7 +100,7 @@ uint16_t mqtt_publish_str(const char* subtopic, const char* data) {
   }
   char topic[64];
   sprintf(topic, "%s/%d/%s", sys_config.mqtt_topic, sys_config.id, subtopic);
-  return mqttClient.publish( topic, 1, true, data);
+  return mqttClient.publish( topic, 1, false, data);
 }
 
 uint16_t mqtt_publish_int(const char* subtopic, int data) {
@@ -139,7 +139,7 @@ void onMqttConnect(bool sessionPresent) {
   ap_list["id"] = sys_config.id;
   ap_list["wifi_fail"] = wifi_failed_ct;
   serializeJson(ap_list, output);
-  int id = mqttClient.publish(sys_config.mqtt_topic, 1, true, output.c_str());
+  int id = mqttClient.publish(sys_config.mqtt_topic, 1, false, output.c_str());
   mqtt_pkt_ids.push_back(id);
   mqtt_queued = true;
 }
