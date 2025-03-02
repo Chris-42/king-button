@@ -1,27 +1,79 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include "my_Network.h"
+#include <Preferences.h>
+#include "cmd_processor.h"
 
+CMD_PROCESSOR cmd_processor = CMD_PROCESSOR();
+
+#define BUTTON_PIN D0
 #define BUTTON_PIN_BITMASK (1ULL << GPIO_NUM_0) // GPIO 0 bitmask for ext1
-#define LED_PIN 15
 #define FactorSeconds 1000000ULL
+#define WIFI_WAIT_TIME 10000
 
-const char* hostname = HOSTNAME;
-const char* ssid = MY_SSID;
-const char* password = MY_SSID_PW;
-const char* mqtt_server = MQTT_SERVER; 
-bool uart_avail;
-uint16_t voltage;
-bool sleep_delayed = false;
+struct systemconfig_t {
+  bool valid;
+  char hostname[32];
+  char ssid[32];
+  char wifi_pw[32];
+  char mqtt_server[32];
+  uint16_t mqtt_server_port;
+  char mqtt_topic[40];
+  uint16_t retry;
+  uint16_t interval;
+  float voltage_faktor;
+};
+RTC_DATA_ATTR struct systemconfig_t sys_config = {.valid = false, .voltage_faktor = 0.002};
+
+bool uart_avail = false;;
+float voltage;
 
 RTC_DATA_ATTR bool last_wifi_failed;
 RTC_DATA_ATTR bool last_send_failed;
 RTC_DATA_ATTR int button_wakeups;
-uint32_t wait_time_us = 10000;
 
-#define Serialprint(...) if(uart_avail) Serial.print(__VA_ARGS__)
-#define Serialprintln(...) if(uart_avail) Serial.println(__VA_ARGS__)
-#define Serialprintf(...) if(uart_avail) Serial.printf(__VA_ARGS__)
+#ifdef DEBUG
+#define Debugprint(...) Serial0.print(__VA_ARGS__)
+#define Debugprintln(...) Serial0.println(__VA_ARGS__)
+#define Debugprintf(...) Serial0.printf(__VA_ARGS__)
+#else
+#define Debugprint(...)
+#define Debugprintln(...)
+#define Debugprintf(...)
+#endif
+
+bool get_system_config(struct systemconfig_t *sys_cfg) {
+  Debugprint("load syscfg ");
+  Preferences prefs;
+  if(prefs.begin("config")) {
+    size_t len = prefs.getBytesLength("system");
+    if(len > 0) {
+      prefs.getBytes("system", sys_cfg, len);
+    }
+    prefs.end();
+  } else {
+    sys_cfg->valid = false;
+    Debugprintln("failed");
+    return false;
+  }
+  Debugprintln("ok");
+  return true;
+}
+
+bool store_system_config(struct systemconfig_t *sys_cfg) {
+  Preferences prefs;
+  if(!prefs.begin("config")) {
+    return false;
+  }  
+  prefs.clear();
+  sys_cfg->valid = true;
+  if(prefs.putBytes("system", sys_cfg, sizeof(systemconfig_t)) != sizeof(systemconfig_t)) {
+    prefs.clear();
+    prefs.end();
+    return false;
+  }
+  prefs.end();
+  return true;
+}
 
 void goToSleep(int seconds) {
   if(seconds) {
@@ -30,23 +82,23 @@ void goToSleep(int seconds) {
   //esp_deep_sleep_enable_gpio_wakeup(BUTTON_PIN_BITMASK, ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK,ESP_EXT1_WAKEUP_ANY_LOW);
   esp_deep_sleep_disable_rom_logging();
-  digitalWrite(LED_PIN, HIGH);
-  Serialprintln("sleep");
+  digitalWrite(LED_BUILTIN, HIGH);
+  Debugprintln("sleep");
   esp_deep_sleep_start();
 }
 
 void sendFunction() {
   // send code
-  Serialprintf("Button pressed %d\r\n", button_wakeups);
-  Serialprintf("voltage: %d\r\n", voltage);
+  Debugprintf("Button pressed %d\r\n", button_wakeups);
+  Debugprintf("voltage: %.2f\r\n", voltage);
   bool success = false;
-  if(!sleep_delayed) {
+  if(!uart_avail) {
     if(success) {
-      goToSleep(86400);
+      goToSleep(sys_config.interval);
       last_send_failed = false;
     } else {
       last_send_failed = true;
-      goToSleep(60);
+      goToSleep(sys_config.retry);
     }
   }
 }
@@ -54,19 +106,16 @@ void sendFunction() {
 void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch(event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serialprintln("WiFi connected");
-      Serialprint("IP address: ");
-      Serialprintln(IPAddress(info.got_ip.ip_info.ip.addr));
-      Serialprint("Hostname: ");
-      Serialprintln(WiFi.getHostname());
+      Debugprintln("WiFi connected");
+      Debugprint("IP address: ");
+      Debugprintln(IPAddress(info.got_ip.ip_info.ip.addr));
+      Debugprint("Hostname: ");
+      Debugprintln(WiFi.getHostname());
       last_wifi_failed = false;
       sendFunction();
       break;
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      Serialprintln("Wifi IP lost");
-      break;
     default:
-      Serialprintln("unhandled Wifi event");
+      Debugprintln("unhandled Wifi event");
   }
 }
 
@@ -76,52 +125,136 @@ void startWifi() {
     WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
   }
   WiFi.setAutoReconnect(true);
-  WiFi.setHostname(hostname);
-  WiFi.begin(ssid, password);
+  WiFi.setHostname(sys_config.hostname);
+  WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
   delay(1);
-  WiFi.setHostname(hostname);
+  WiFi.setHostname(sys_config.hostname);
   WiFi.onEvent(WiFiEvent, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
 }
 
+void handleCmd(String &cmd) {
+  Debugprintf("cmd:'%s'\r\n", cmd.c_str());
+  if(cmd == "reset") {
+    Serial.println();
+    esp_restart();
+  } else if(cmd.startsWith("ssid ")) {
+    char str[128];
+    if(sscanf(cmd.c_str(), "ssid %127s", str) != 1) {
+      Serial.println("ssid <ssid>");
+      return;
+    }
+    Serial.println();
+    strncpy(sys_config.ssid, str, sizeof(sys_config.ssid));
+  } else if(cmd.startsWith("pw ")) {
+    char str[128];
+    if(sscanf(cmd.c_str(), "pw %127s", str) != 1) {
+      Serial.println("pw <password>");
+      return;
+    }
+    Serial.println();
+    strncpy(sys_config.wifi_pw, str, sizeof(sys_config.wifi_pw));
+  } else if(cmd.startsWith("name ")) {
+    char str[128];
+    if(sscanf(cmd.c_str(), "name %127s", str) != 1) {
+      Serial.println("name <hostname>");
+      return;
+    }
+    Serial.println();
+    strncpy(sys_config.hostname, str, sizeof(sys_config.hostname));
+  } else if(cmd.startsWith("interval ")) {
+    int val;
+    if(sscanf(cmd.c_str(), "interval %d", &val) != 1) {
+      Serial.println("interval <time>");
+      return;
+    }
+    Serial.println();
+    sys_config.interval = val;
+  } else if(cmd.startsWith("volt ")) {
+    float v;
+    if(sscanf(cmd.c_str(), "volt %f", &v) != 1) {
+      Serial.println("volt <measured voltage>");
+      return;
+    }
+    Serial.println();
+    sys_config.voltage_faktor = v / analogReadMilliVolts(6);
+  } else if(cmd.startsWith("sleep ")) {
+    int val;
+    if(sscanf(cmd.c_str(), "sleep %d", &val) != 1) {
+      Serial.println("sleep <time>");
+      return;
+    }
+    Serial.println();
+    goToSleep(val);
+  } else if(cmd == "show") {
+    Serial.println();
+    Serial.printf("ssid %s\r\n", sys_config.ssid);
+    Serial.printf("pw %s\r\n", sys_config.wifi_pw);
+    Serial.printf("name %s\r\n", sys_config.hostname);
+    Serial.printf("interval %d\r\n", sys_config.interval);
+    Serial.printf("volt f %.3f\r\n", sys_config.voltage_faktor * 1000.0);
+  } else if(cmd == "save") {
+    if(store_system_config(&sys_config)) {
+      Serial.println(" ok");
+    } else {
+      Serial.println(" failed");
+    }
+  } else if(cmd == "send") {
+    Serial.println();
+    sendFunction();
+  } else if(cmd == "v") {
+    Serial.printf(" %.2f\r\n", voltage);
+  } else if(cmd == "") {
+    Serial.println();
+  } else {
+    Serial.println(" ?" + cmd + "?");
+  }
+}
+
 void setup() {
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(9, INPUT_PULLUP);
-  digitalWrite(LED_PIN, LOW);
-  int ct = 100;
-  Serial.begin(115200);
-  if(!digitalRead(9)) {
-    while(!Serial) {
-    };
-  }
-  // check if a serial is connected to avoid printing if not
-  int serial_queue_length = Serial.availableForWrite(); // get serial queue length
-  Serial.println("Initialization start serial test"); //keep long to allow writability detection
-  delay(10); //allow serial to write
-  Serial.println((serial_queue_length - Serial.availableForWrite()));
-  if((serial_queue_length - Serial.availableForWrite()) < 20) { //at least some chars written out from queue
-    Serial.printf("Ser %d %d\r\n", serial_queue_length, Serial.availableForWrite());
-    Serial.println("uart ok");
-    uart_avail = true;
-  }
-  Serialprintln("Init");
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  digitalWrite(LED_BUILTIN, LOW);
+  Serial0.begin(115200);
+  Debugprintln("Init");
   esp_sleep_wakeup_cause_t wakeup_reason;
   wakeup_reason = esp_sleep_get_wakeup_cause();
   //on reset
   if(wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
-    Serialprintln("reset, waiting 60 sec");
-    wait_time_us = 60000;
-    sleep_delayed = true;
+    Debugprintln("reset");
   } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
-    Serialprintf("TIMER wakeup\n");
+    Debugprintln("TIMER wakeup");
   } else if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
-    Serialprintf("EXT1 wakeup\n");
+    Debugprintln("EXT1 wakeup");
     button_wakeups++;
   } else {
-    Serialprintf("wakeup %d\n", wakeup_reason);
+    Debugprintf("wakeup %d\n", wakeup_reason);
   }
-  startWifi();
-  voltage = analogRead(1);
-  Serialprintln("Init end");
+  if((wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) ||
+     ((wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) && !digitalRead(BUTTON_PIN))) {
+    Serial.begin(115200);
+    int ct = 20;
+    while(!Serial && ct) {
+      ct--;
+      delay(10);
+    }
+    if(ct) {
+      uart_avail = true;
+      Debugprintln("usb uart ok");
+    } else {
+      Debugprintln("no usb uart");
+    }
+  }
+  if(!sys_config.valid) {
+    get_system_config(&sys_config);
+  }
+  if(sys_config.valid) {
+    startWifi();
+  }
+  if(uart_avail) {
+    cmd_processor.registerCmd("", handleCmd);
+  }
+  voltage = sys_config.voltage_faktor * analogReadMilliVolts(6);
+  Debugprintln("Init end");
 }
 
 uint32_t last_blink = 0;
@@ -129,12 +262,15 @@ void loop() {
   uint32_t ti = millis();
   if((ti - last_blink) > 100) {
     last_blink = ti;
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
   // wait max 10 sec until sleep and retry
-  if(ti > wait_time_us) {
+  if(!uart_avail && (ti > WIFI_WAIT_TIME)) {
     last_wifi_failed = true;
-    goToSleep(60);
+    goToSleep(sys_config.retry);
+  }
+  if(uart_avail) {
+    cmd_processor.process();
   }
 }
 
