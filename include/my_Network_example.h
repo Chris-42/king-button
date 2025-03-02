@@ -1,0 +1,5 @@
+#define MY_SSID "ssid"
+#define MY_SSID_PW "pw"
+#define MQTT_SERVER "server"
+#define SYSLOG_SERVER "server"
+#define HOSTNAME "ESP-Name"
