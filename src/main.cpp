@@ -34,7 +34,7 @@ JsonDocument ap_list;              // json access point list from scan
 std::vector<int> mqtt_pkt_ids;     // list of published packets
 volatile bool mqtt_queued = false; //set if mqtt client has published async
 
-RTC_DATA_ATTR bool last_wifi_failed;
+RTC_DATA_ATTR int wifi_failed_ct;
 RTC_DATA_ATTR bool last_send_failed;
 RTC_DATA_ATTR int button_wakeups;
 
@@ -137,6 +137,7 @@ void onMqttConnect(bool sessionPresent) {
   ap_list["voltage"] = voltage;
   ap_list["button_ct"] = button_wakeups;
   ap_list["id"] = sys_config.id;
+  ap_list["wifi_fail"] = wifi_failed_ct;
   serializeJson(ap_list, output);
   int id = mqttClient.publish(sys_config.mqtt_topic, 1, true, output.c_str());
   mqtt_pkt_ids.push_back(id);
@@ -158,7 +159,6 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       Debugprintln(IPAddress(info.got_ip.ip_info.ip.addr));
       Debugprint("Hostname: ");
       Debugprintln(WiFi.getHostname());
-      last_wifi_failed = false;
       sendMqtt();
       break;
     case ARDUINO_EVENT_WIFI_SCAN_DONE:
@@ -190,9 +190,7 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 
 void startWifi() {
   WiFi.mode(WIFI_STA);
-  //if(last_wifi_failed) {
-    WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
-  //}
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
   WiFi.setAutoReconnect(true);
   WiFi.setHostname(sys_config.hostname);
   WiFi.onEvent(WiFiEvent, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
@@ -380,8 +378,16 @@ void loop() {
   if((ti - last_blink) > 100) {
     last_blink = ti;
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    if(!uart_avail && Serial) {
+      Debugprintln("detected serial");
+      uart_avail = true;
+    }
+    if(uart_avail && !Serial) {
+      Debugprintln("serial disconnect");
+      uart_avail = false;
+      goToSleep(sys_config.retry);
+    }
   }
-  
 
   if(mqtt_queued && !mqtt_pkt_ids.size()) {
     Debugprintln("mqtt fin");
@@ -395,9 +401,8 @@ void loop() {
 
   // wait max 10 sec until sleep and retry
   if(!uart_avail && (ti > WIFI_WAIT_TIME)) {
-    last_wifi_failed = true;
+    wifi_failed_ct++;
     last_send_failed = true;
-    goToSleep(sys_config.retry);
   }
 
   if(uart_avail) {
