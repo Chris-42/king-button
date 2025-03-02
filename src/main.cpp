@@ -30,9 +30,9 @@ RTC_DATA_ATTR struct systemconfig_t sys_config;
 
 bool uart_avail = false;;
 float voltage;
-std::vector<int> mqtt_pkt_ids;
-JsonDocument ap_list;
-volatile bool mqtt_queued = false;
+JsonDocument ap_list;              // json access point list from scan
+std::vector<int> mqtt_pkt_ids;     // list of published packets
+volatile bool mqtt_queued = false; //set if mqtt client has published async
 
 RTC_DATA_ATTR bool last_wifi_failed;
 RTC_DATA_ATTR bool last_send_failed;
@@ -139,6 +139,7 @@ void onMqttConnect(bool sessionPresent) {
   ap_list["id"] = sys_config.id;
   serializeJson(ap_list, output);
   int id = mqttClient.publish(sys_config.mqtt_topic, 1, true, output.c_str());
+  mqtt_pkt_ids.push_back(id);
   mqtt_queued = true;
 }
 
