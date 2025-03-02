@@ -1,8 +1,11 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Preferences.h>
+#include <AsyncMqttClient.h>
+#include <ArduinoJson.h>
 #include "cmd_processor.h"
 
+AsyncMqttClient mqttClient;
 CMD_PROCESSOR cmd_processor = CMD_PROCESSOR();
 
 #define BUTTON_PIN D0
@@ -21,11 +24,15 @@ struct systemconfig_t {
   uint16_t retry;
   uint16_t interval;
   float voltage_faktor;
+  uint16_t id;
 };
-RTC_DATA_ATTR struct systemconfig_t sys_config = {.valid = false, .voltage_faktor = 0.002};
+RTC_DATA_ATTR struct systemconfig_t sys_config;
 
 bool uart_avail = false;;
 float voltage;
+std::vector<int> mqtt_pkt_ids;
+JsonDocument ap_list;
+volatile bool mqtt_queued = false;
 
 RTC_DATA_ATTR bool last_wifi_failed;
 RTC_DATA_ATTR bool last_send_failed;
@@ -87,20 +94,59 @@ void goToSleep(int seconds) {
   esp_deep_sleep_start();
 }
 
-void sendFunction() {
-  // send code
+uint16_t mqtt_publish_str(const char* subtopic, const char* data) {
+  if(!mqttClient.connected()) {
+    return 0;
+  }
+  char topic[64];
+  sprintf(topic, "%s/%d/%s", sys_config.mqtt_topic, sys_config.id, subtopic);
+  return mqttClient.publish( topic, 1, true, data);
+}
+
+uint16_t mqtt_publish_int(const char* subtopic, int data) {
+  char str[32];
+  sprintf(str, "%d", data);
+  return mqtt_publish_str(subtopic, str);
+}
+
+uint16_t mqtt_publish_float(const char* subtopic, float data) {
+  char str[32];
+  sprintf(str, "%.2f", data);
+  return mqtt_publish_str(subtopic, str);
+}
+
+void onMqttPublish(int packet_id) {
+  std::erase_if(mqtt_pkt_ids, [packet_id] (const int& id) { return id == packet_id; });
+}
+
+void onMqttConnect(bool sessionPresent) {
+  char uptime[16];
+  char str[16];
+  
+  Debugprintln("Connected to MQTT.");
+  Debugprintf("Session present: %d\r\n", sessionPresent);
   Debugprintf("Button pressed %d\r\n", button_wakeups);
   Debugprintf("voltage: %.2f\r\n", voltage);
-  bool success = false;
-  if(!uart_avail) {
-    if(success) {
-      goToSleep(sys_config.interval);
-      last_send_failed = false;
-    } else {
-      last_send_failed = true;
-      goToSleep(sys_config.retry);
-    }
-  }
+
+  mqtt_pkt_ids.clear();
+  mqtt_pkt_ids.push_back(mqtt_publish_float("voltage", voltage));
+  mqtt_pkt_ids.push_back(mqtt_publish_int("button_ct", button_wakeups));
+  String output;
+  serializeJson(ap_list, output);
+  mqtt_pkt_ids.push_back(mqtt_publish_str("aps", output.c_str()));
+  ap_list["voltage"] = voltage;
+  ap_list["button_ct"] = button_wakeups;
+  ap_list["id"] = sys_config.id;
+  serializeJson(ap_list, output);
+  int id = mqttClient.publish(sys_config.mqtt_topic, 1, true, output.c_str());
+  mqtt_queued = true;
+}
+
+void sendMqtt() {
+  mqttClient.setServer(sys_config.mqtt_server, sys_config.mqtt_server_port);
+  mqttClient.onConnect(onMqttConnect);
+  mqttClient.onPublish(onMqttPublish);
+  mqttClient.connect();
 }
 
 void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -112,7 +158,29 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       Debugprint("Hostname: ");
       Debugprintln(WiFi.getHostname());
       last_wifi_failed = false;
-      sendFunction();
+      sendMqtt();
+      break;
+    case ARDUINO_EVENT_WIFI_SCAN_DONE:
+      if(info.wifi_scan_done.status == 0) {
+        Debugprintf("scan ok: %d APs\r\n", info.wifi_scan_done.number);
+        ap_list.clear();
+        for(int i = 0; i < info.wifi_scan_done.number; ++i) {
+          ap_list["ap"][i]["ssid"] = WiFi.SSID(i);
+          ap_list["ap"][i]["bssid"] = WiFi.BSSIDstr(i);
+          ap_list["ap"][i]["rssi"] = WiFi.RSSI(i);
+          ap_list["ap"][i]["channel"] = WiFi.channel(i);
+        }
+      } else {
+        Debugprintln("scan failed");
+      }
+      #ifdef DEBUG
+      {
+        String output;
+        serializeJson(ap_list, output);
+        Debugprintf("%s\r\n", output.c_str());
+      }
+      #endif
+      WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
       break;
     default:
       Debugprintln("unhandled Wifi event");
@@ -121,15 +189,15 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 
 void startWifi() {
   WiFi.mode(WIFI_STA);
-  if(last_wifi_failed) {
+  //if(last_wifi_failed) {
     WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
-  }
+  //}
   WiFi.setAutoReconnect(true);
   WiFi.setHostname(sys_config.hostname);
-  WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
-  delay(1);
-  WiFi.setHostname(sys_config.hostname);
   WiFi.onEvent(WiFiEvent, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent(WiFiEvent, WiFiEvent_t::ARDUINO_EVENT_WIFI_SCAN_DONE);
+  //WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
+  WiFi.scanNetworks(true);
 }
 
 void handleCmd(String &cmd) {
@@ -161,6 +229,38 @@ void handleCmd(String &cmd) {
     }
     Serial.println();
     strncpy(sys_config.hostname, str, sizeof(sys_config.hostname));
+  } else if(cmd.startsWith("server ")) {
+    char str[128];
+    if(sscanf(cmd.c_str(), "server %127s", str) != 1) {
+      Serial.println("server <mqtt server>");
+      return;
+    }
+    Serial.println();
+    strncpy(sys_config.mqtt_server, str, sizeof(sys_config.mqtt_server));
+  } else if(cmd.startsWith("topic ")) {
+    char str[128];
+    if(sscanf(cmd.c_str(), "topic %127s", str) != 1) {
+      Serial.println("topic <base topic>");
+      return;
+    }
+    Serial.println();
+    strncpy(sys_config.mqtt_topic, str, sizeof(sys_config.mqtt_topic));
+  } else if(cmd.startsWith("port ")) {
+    int val;
+    if(sscanf(cmd.c_str(), "port %d", &val) != 1) {
+      Serial.println("port <mqtt port>");
+      return;
+    }
+    Serial.println();
+    sys_config.mqtt_server_port = val;
+  } else if(cmd.startsWith("retry ")) {
+    int val;
+    if(sscanf(cmd.c_str(), "retry %d", &val) != 1) {
+      Serial.println("retry <time>");
+      return;
+    }
+    Serial.println();
+    sys_config.retry = val;
   } else if(cmd.startsWith("interval ")) {
     int val;
     if(sscanf(cmd.c_str(), "interval %d", &val) != 1) {
@@ -169,6 +269,14 @@ void handleCmd(String &cmd) {
     }
     Serial.println();
     sys_config.interval = val;
+  } else if(cmd.startsWith("id ")) {
+    int val;
+    if(sscanf(cmd.c_str(), "id %d", &val) != 1) {
+      Serial.println("id <number>");
+      return;
+    }
+    Serial.println();
+    sys_config.id = val;
   } else if(cmd.startsWith("volt ")) {
     float v;
     if(sscanf(cmd.c_str(), "volt %f", &v) != 1) {
@@ -190,6 +298,11 @@ void handleCmd(String &cmd) {
     Serial.printf("ssid %s\r\n", sys_config.ssid);
     Serial.printf("pw %s\r\n", sys_config.wifi_pw);
     Serial.printf("name %s\r\n", sys_config.hostname);
+    Serial.printf("id %d\r\n", sys_config.id);
+    Serial.printf("server %s\r\n", sys_config.mqtt_server);
+    Serial.printf("port %d\r\n", sys_config.mqtt_server_port);
+    Serial.printf("topic %s\r\n", sys_config.mqtt_topic);
+    Serial.printf("retry %d\r\n", sys_config.retry);
     Serial.printf("interval %d\r\n", sys_config.interval);
     Serial.printf("volt f %.3f\r\n", sys_config.voltage_faktor * 1000.0);
   } else if(cmd == "save") {
@@ -200,7 +313,7 @@ void handleCmd(String &cmd) {
     }
   } else if(cmd == "send") {
     Serial.println();
-    sendFunction();
+    sendMqtt();
   } else if(cmd == "v") {
     Serial.printf(" %.2f\r\n", voltage);
   } else if(cmd == "") {
@@ -245,7 +358,9 @@ void setup() {
     }
   }
   if(!sys_config.valid) {
-    get_system_config(&sys_config);
+    if(!get_system_config(&sys_config)) {
+      sys_config = {.mqtt_server_port = 1883, .retry = 30, .interval = 7200, .voltage_faktor = 0.002};
+    }
   }
   if(sys_config.valid) {
     startWifi();
@@ -264,11 +379,25 @@ void loop() {
     last_blink = ti;
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
+  
+
+  if(mqtt_queued && !mqtt_pkt_ids.size()) {
+    Debugprintln("mqtt fin");
+    mqtt_queued = false;
+    button_wakeups = 0;
+    last_send_failed = false;
+    if(!uart_avail) {
+      goToSleep(sys_config.interval);
+    }
+  }
+
   // wait max 10 sec until sleep and retry
   if(!uart_avail && (ti > WIFI_WAIT_TIME)) {
     last_wifi_failed = true;
+    last_send_failed = true;
     goToSleep(sys_config.retry);
   }
+
   if(uart_avail) {
     cmd_processor.process();
   }
