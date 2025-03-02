@@ -1,5 +1,8 @@
 
 <pre>
+
+because of scan runtime is about 6-10 sec
+
 mqtt:
 
 test/0/voltage 3.88

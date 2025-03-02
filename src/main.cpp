@@ -90,7 +90,7 @@ void goToSleep(int seconds) {
   esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK,ESP_EXT1_WAKEUP_ANY_LOW);
   esp_deep_sleep_disable_rom_logging();
   digitalWrite(LED_BUILTIN, HIGH);
-  Debugprintln("sleep");
+  Debugprintf("sleep after %d ms", millis());
   esp_deep_sleep_start();
 }
 
@@ -325,6 +325,7 @@ void handleCmd(String &cmd) {
 }
 
 void setup() {
+  setCpuFrequencyMhz(80);
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   digitalWrite(LED_BUILTIN, LOW);
