@@ -3,15 +3,17 @@
 #include <Preferences.h>
 #include <AsyncMqttClient.h>
 #include <ArduinoJson.h>
+#include "EasyButton.h"
 #include "cmd_processor.h"
-
-AsyncMqttClient mqttClient;
-CMD_PROCESSOR cmd_processor = CMD_PROCESSOR();
 
 #define BUTTON_PIN D0
 #define BUTTON_PIN_BITMASK (1ULL << GPIO_NUM_0) // GPIO 0 bitmask for ext1
 #define FactorSeconds 1000000ULL
-#define WIFI_WAIT_TIME 10000
+#define WIFI_WAIT_TIME 15000UL
+
+AsyncMqttClient mqttClient;
+CMD_PROCESSOR cmd_processor = CMD_PROCESSOR();
+EasyButton button(BUTTON_PIN);
 
 struct systemconfig_t {
   bool valid;
@@ -25,18 +27,24 @@ struct systemconfig_t {
   uint16_t interval;
   float voltage_faktor;
   uint16_t id;
+  uint32_t wifi_wait;
+  uint16_t scan_channel_time;
+  bool ext_antenna;
 };
 RTC_DATA_ATTR struct systemconfig_t sys_config;
 
-bool uart_avail = false;;
+bool uart_avail = false;
 float voltage;
 JsonDocument ap_list;              // json access point list from scan
 std::vector<int> mqtt_pkt_ids;     // list of published packets
-volatile bool mqtt_queued = false; //set if mqtt client has published async
+volatile bool mqtt_queued = false; // set if mqtt client has published async
+uint32_t mid_time;                 // used to calc run time
+uint32_t wifi_start_time = 0;
 
-RTC_DATA_ATTR int wifi_failed_ct;
-RTC_DATA_ATTR bool last_send_failed;
-RTC_DATA_ATTR int button_wakeups;
+RTC_NOINIT_ATTR int wifi_failed_ct;
+RTC_NOINIT_ATTR int mqtt_failed_ct;
+RTC_NOINIT_ATTR int button_wakeups;
+RTC_NOINIT_ATTR uint32_t run_time;
 
 #ifdef DEBUG
 #define Debugprint(...) Serial0.print(__VA_ARGS__)
@@ -90,7 +98,8 @@ void goToSleep(int seconds) {
   esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK,ESP_EXT1_WAKEUP_ANY_LOW);
   esp_deep_sleep_disable_rom_logging();
   digitalWrite(LED_BUILTIN, HIGH);
-  Debugprintf("sleep after %d ms", millis());
+  Debugprintf("sleep for %d sec after %d ms\r\n\r\n", seconds, millis());
+  run_time += millis() - mid_time;
   esp_deep_sleep_start();
 }
 
@@ -125,23 +134,31 @@ void onMqttConnect(bool sessionPresent) {
   
   Debugprintln("Connected to MQTT.");
   Debugprintf("Session present: %d\r\n", sessionPresent);
-  Debugprintf("Button pressed %d\r\n", button_wakeups);
-  Debugprintf("voltage: %.2f\r\n", voltage);
+  //Debugprintf("Button pressed %d\r\n", button_wakeups);
+  //Debugprintf("voltage: %.2f\r\n", voltage);
 
   mqtt_pkt_ids.clear();
-  mqtt_pkt_ids.push_back(mqtt_publish_float("voltage", voltage));
-  mqtt_pkt_ids.push_back(mqtt_publish_int("button_ct", button_wakeups));
+  //mqtt_pkt_ids.push_back(mqtt_publish_float("voltage", voltage));
+  //mqtt_pkt_ids.push_back(mqtt_publish_int("button_ct", button_wakeups));
   String output;
-  serializeJson(ap_list, output);
-  mqtt_pkt_ids.push_back(mqtt_publish_str("aps", output.c_str()));
+  //serializeJson(ap_list, output);
+  //mqtt_pkt_ids.push_back(mqtt_publish_str("aps", output.c_str()));
   ap_list["voltage"] = voltage;
   ap_list["button_ct"] = button_wakeups;
   ap_list["id"] = sys_config.id;
   ap_list["wifi_fail"] = wifi_failed_ct;
+  ap_list["mqtt_fail"] = mqtt_failed_ct;
+  mid_time = millis();
+  run_time += mid_time;
+  ap_list["runtime"] = run_time;
   serializeJson(ap_list, output);
   int id = mqttClient.publish(sys_config.mqtt_topic, 1, false, output.c_str());
   mqtt_pkt_ids.push_back(id);
   mqtt_queued = true;
+  #ifdef DEBUG
+  serializeJsonPretty(ap_list, output);
+  Debugprintln(output);
+  #endif
 }
 
 void sendMqtt() {
@@ -181,6 +198,7 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
         Debugprintf("%s\r\n", output.c_str());
       }
       #endif
+      wifi_start_time = millis();
       WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
       break;
     default:
@@ -196,12 +214,19 @@ void startWifi() {
   WiFi.onEvent(WiFiEvent, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.onEvent(WiFiEvent, WiFiEvent_t::ARDUINO_EVENT_WIFI_SCAN_DONE);
   //WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
-  WiFi.scanNetworks(true);
+  WiFi.scanNetworks(true, false, false, sys_config.scan_channel_time);
 }
 
 void handleCmd(String &cmd) {
   Debugprintf("cmd:'%s'\r\n", cmd.c_str());
   if(cmd == "reset") {
+    Serial.println();
+    wifi_failed_ct = 0;
+    mqtt_failed_ct = 0;
+    button_wakeups = 0;
+    run_time = 0;
+    esp_restart();
+  } else if(cmd== "restart") {
     Serial.println();
     esp_restart();
   } else if(cmd.startsWith("ssid ")) {
@@ -276,6 +301,22 @@ void handleCmd(String &cmd) {
     }
     Serial.println();
     sys_config.id = val;
+  } else if(cmd.startsWith("scantime ")) {
+    int val;
+    if(sscanf(cmd.c_str(), "scantime %d", &val) != 1) {
+      Serial.println("scantime <ms scan each channel>");
+      return;
+    }
+    Serial.println();
+    sys_config.scan_channel_time = val;
+  } else if(cmd.startsWith("wait ")) {
+    int val;
+    if(sscanf(cmd.c_str(), "wait %d", &val) != 1) {
+      Serial.println("wait <seconds to wait for connect>");
+      return;
+    }
+    Serial.println();
+    sys_config.wifi_wait = val;
   } else if(cmd.startsWith("volt ")) {
     float v;
     if(sscanf(cmd.c_str(), "volt %f", &v) != 1) {
@@ -284,6 +325,16 @@ void handleCmd(String &cmd) {
     }
     Serial.println();
     sys_config.voltage_faktor = v / analogReadMilliVolts(6);
+  } else if(cmd.startsWith("ant ")) {
+    if(cmd == "ant ext") {
+      sys_config.ext_antenna = true;
+    } else if(cmd == "ant int") {
+      sys_config.ext_antenna = true;
+    } else {
+      Serial.println("ant <int|ext>");
+      return;
+    }
+    Serial.println();
   } else if(cmd.startsWith("sleep ")) {
     int val;
     if(sscanf(cmd.c_str(), "sleep %d", &val) != 1) {
@@ -303,7 +354,10 @@ void handleCmd(String &cmd) {
     Serial.printf("topic %s\r\n", sys_config.mqtt_topic);
     Serial.printf("retry %d\r\n", sys_config.retry);
     Serial.printf("interval %d\r\n", sys_config.interval);
+    Serial.printf("wait %d\r\n", sys_config.wifi_wait);
+    Serial.printf("scantime %d\r\n", sys_config.scan_channel_time);
     Serial.printf("volt f %.3f\r\n", sys_config.voltage_faktor * 1000.0);
+    Serial.println(sys_config.ext_antenna ? "ant ext" : "ant int");
   } else if(cmd == "save") {
     if(store_system_config(&sys_config)) {
       Serial.println(" ok");
@@ -327,13 +381,25 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   digitalWrite(LED_BUILTIN, LOW);
+  #ifdef DEBUG
   Serial0.begin(115200);
+  #endif
   Debugprintln("Init");
-  esp_sleep_wakeup_cause_t wakeup_reason;
-  wakeup_reason = esp_sleep_get_wakeup_cause();
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  esp_reset_reason_t reset_reason = esp_reset_reason();
   //on reset
   if(wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
-    Debugprintln("reset");
+    Debugprintf("reset %d\r\n", reset_reason);
+    if((reset_reason == ESP_RST_UNKNOWN) ||
+       (reset_reason == ESP_RST_POWERON) ||
+       (reset_reason == ESP_RST_BROWNOUT) ||
+       //(reset_reason == ESP_RST_USB) ||
+       (reset_reason == ESP_RST_PWR_GLITCH)) {
+      wifi_failed_ct = 0;
+      mqtt_failed_ct = 0;
+      button_wakeups = 0;
+      run_time = 0;
+    }
   } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
     Debugprintln("TIMER wakeup");
   } else if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
@@ -344,25 +410,37 @@ void setup() {
   }
   if((wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) ||
      ((wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) && !digitalRead(BUTTON_PIN))) {
-    Serial.begin(115200);
-    int ct = 20;
-    while(!Serial && ct) {
-      ct--;
-      delay(10);
-    }
-    if(ct) {
+    if(usb_serial_jtag_is_connected()) {
+      Debugprintln("usb connected");
       uart_avail = true;
-      Debugprintln("usb uart ok");
-    } else {
-      Debugprintln("no usb uart");
+      button.begin();
+      Serial.begin(115200);
+      int ct = 20;
+      while(!Serial && ct) {
+        ct--;
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+        delay(200);
+      }
     }
   }
   if(!sys_config.valid) {
     if(!get_system_config(&sys_config)) {
-      sys_config = {.mqtt_server_port = 1883, .retry = 30, .interval = 7200, .voltage_faktor = 0.002};
+      sys_config = {.mqtt_server_port = 1883,
+                    .retry = 30,
+                    .interval = 7200,
+                    .voltage_faktor = 0.002,
+                    .wifi_wait = 15000,
+                    .scan_channel_time = 300};
     }
   }
   if(sys_config.valid) {
+    if(sys_config.ext_antenna) {
+      pinMode(3, OUTPUT);
+      digitalWrite(3, LOW);//turn on this function
+      delay(100);
+      pinMode(14, OUTPUT); 
+      digitalWrite(14, HIGH);//use external antenna
+    }
     startWifi();
   }
   if(uart_avail) {
@@ -375,16 +453,34 @@ void setup() {
 uint32_t last_blink = 0;
 void loop() {
   uint32_t ti = millis();
-  if((ti - last_blink) > 100) {
+
+  button.read();
+  if(button.wasPressed()) {
+    button_wakeups++;
+    if(WiFi.isConnected()) {
+      wifi_start_time = millis();
+      sendMqtt();
+    } else {
+      WiFi.disconnect();
+      delay(10);
+      wifi_start_time = millis();
+      WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
+    }
+  }
+
+  if((ti - last_blink) > 200) {
     last_blink = ti;
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-    if(!uart_avail && Serial) {
+    if(!uart_avail && usb_serial_jtag_is_connected()) {
       Debugprintln("detected serial");
+      button.begin();
+      Serial.begin(115200);
       uart_avail = true;
     }
-    if(uart_avail && !Serial) {
+    if(uart_avail && !usb_serial_jtag_is_connected()) {
       Debugprintln("serial disconnect");
       uart_avail = false;
+      run_time = 0;
       goToSleep(sys_config.retry);
     }
   }
@@ -393,16 +489,30 @@ void loop() {
     Debugprintln("mqtt fin");
     mqtt_queued = false;
     button_wakeups = 0;
-    last_send_failed = false;
+    mqttClient.disconnect();
+    wifi_start_time = 0;
     if(!uart_avail) {
       goToSleep(sys_config.interval);
     }
   }
 
   // wait max 10 sec until sleep and retry
-  if(!uart_avail && (ti > WIFI_WAIT_TIME)) {
-    wifi_failed_ct++;
-    last_send_failed = true;
+  if(wifi_start_time && (ti - wifi_start_time) > WIFI_WAIT_TIME) {
+    Debugprintln("send failed");
+    wifi_start_time = 0;
+    mqtt_queued = false; 
+    if(!WiFi.isConnected()) {
+      Debugprintln("wifi failed");
+      wifi_failed_ct++;
+    } else {
+      Debugprintln("mqtt failed");
+      mqtt_failed_ct++;
+    }
+    if(!uart_avail) {
+      goToSleep(sys_config.retry);
+    } else {
+      mqttClient.disconnect();
+    }
   }
 
   if(uart_avail) {
