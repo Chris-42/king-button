@@ -369,6 +369,25 @@ void handleCmd(String &cmd) {
     sendMqtt();
   } else if(cmd == "v") {
     Serial.printf(" %.2f\r\n", voltage);
+  } else if((cmd == "?") || cmd == "h") {
+    Serial.println("\r\nssid <ssid>");
+    Serial.println("pw <password>");
+    Serial.println("name <hostname>");
+    Serial.println("server <mqtt server>");
+    Serial.println("topic <base topic>");
+    Serial.println("port <mqtt port>");
+    Serial.println("retry <time>");
+    Serial.println("interval <time>");
+    Serial.println("id <number>");
+    Serial.println("scantime <ms scan each channel>");
+    Serial.println("wait <seconds to wait for connect>");
+    Serial.println("volt <measured voltage>");
+    Serial.println("ant <int|ext>");
+    Serial.println("sleep <time>");
+    Serial.println("restart");
+    Serial.println("reset");
+    Serial.println("save");
+    Serial.println("show");
   } else if(cmd == "") {
     Serial.println();
   } else {
