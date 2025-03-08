@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <Preferences.h>
 #include <AsyncMqttClient.h>
 #include <ArduinoJson.h>
@@ -38,8 +39,15 @@ float voltage;
 JsonDocument ap_list;              // json access point list from scan
 std::vector<int> mqtt_pkt_ids;     // list of published packets
 volatile bool mqtt_queued = false; // set if mqtt client has published async
+bool send_failed = false;
 uint32_t mid_time;                 // used to calc run time
 uint32_t wifi_start_time = 0;
+uint16_t send_cause = 0;
+uint8_t channel = 1;
+uint8_t app_ct = 0;
+uint8_t best_channel = 0;
+int best_rssi = -200;
+uint8_t best_bssid[6];
 
 RTC_NOINIT_ATTR int wifi_failed_ct;
 RTC_NOINIT_ATTR int mqtt_failed_ct;
@@ -150,6 +158,7 @@ void onMqttConnect(bool sessionPresent) {
   ap_list["mqtt_fail"] = mqtt_failed_ct;
   mid_time = millis();
   run_time += mid_time;
+  ap_list["send_cause"] = send_cause;
   ap_list["runtime"] = run_time;
   serializeJson(ap_list, output);
   int id = mqttClient.publish(sys_config.mqtt_topic, 1, false, output.c_str());
@@ -162,16 +171,19 @@ void onMqttConnect(bool sessionPresent) {
 }
 
 void sendMqtt() {
-  mqttClient.setServer(sys_config.mqtt_server, sys_config.mqtt_server_port);
-  mqttClient.onConnect(onMqttConnect);
-  mqttClient.onPublish(onMqttPublish);
+  //mqttClient.setServer(sys_config.mqtt_server, sys_config.mqtt_server_port);
+  //mqttClient.onConnect(onMqttConnect);
+  //mqttClient.onPublish(onMqttPublish);
   mqttClient.connect();
 }
 
 void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch(event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Debugprintf("%d wifi connected in ch %d\r\n", millis(), WiFi.channel());
+      break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Debugprintln("WiFi connected");
+      Debugprintf("%d WiFi got ip\r\n", millis());
       Debugprint("IP address: ");
       Debugprintln(IPAddress(info.got_ip.ip_info.ip.addr));
       Debugprint("Hostname: ");
@@ -180,13 +192,34 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       break;
     case ARDUINO_EVENT_WIFI_SCAN_DONE:
       if(info.wifi_scan_done.status == 0) {
-        Debugprintf("scan ok: %d APs\r\n", info.wifi_scan_done.number);
-        ap_list.clear();
+        Debugprintf("%d scan ok: %d APs\r\n", millis(), info.wifi_scan_done.number);
         for(int i = 0; i < info.wifi_scan_done.number; ++i) {
-          ap_list["ap"][i]["ssid"] = WiFi.SSID(i);
-          ap_list["ap"][i]["bssid"] = WiFi.BSSIDstr(i);
-          ap_list["ap"][i]["rssi"] = WiFi.RSSI(i);
-          ap_list["ap"][i]["channel"] = WiFi.channel(i);
+          ap_list["ap"][app_ct]["ssid"] = WiFi.SSID(i);
+          ap_list["ap"][app_ct]["bssid"] = WiFi.BSSIDstr(i);
+          ap_list["ap"][app_ct]["rssi"] = WiFi.RSSI(i);
+          ap_list["ap"][app_ct]["channel"] = WiFi.channel(i);
+          if((WiFi.SSID(i) == sys_config.ssid) && (WiFi.RSSI(i) > best_rssi)) {
+            best_rssi = WiFi.RSSI(i);
+            best_channel = WiFi.channel(i);
+            bcopy(WiFi.BSSID(i), best_bssid, sizeof(best_bssid));
+          }
+          app_ct++;
+        }
+        bool scan_done = false;
+        switch(channel) {
+          case 1: case 6:
+            channel += 6;
+            return;
+          case 11:
+            channel = 13;
+            return;
+          default:
+            scan_done = true;
+            break;
+        }
+        if(!scan_done) {
+          WiFi.scanNetworks(true, false, false, sys_config.scan_channel_time, channel);
+          return;
         }
       } else {
         Debugprintln("scan failed");
@@ -199,7 +232,13 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       }
       #endif
       wifi_start_time = millis();
-      WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
+      if(channel) {
+        Debugprintf("conecting on ch %d\r\n", best_channel);
+        WiFi.begin(sys_config.ssid, sys_config.wifi_pw, best_channel, best_bssid);
+      } else {
+        Debugprintln("connecting auto");
+        WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
+      }
       break;
     default:
       Debugprintln("unhandled Wifi event");
@@ -208,13 +247,14 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 
 void startWifi() {
   WiFi.mode(WIFI_STA);
-  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
-  WiFi.setAutoReconnect(true);
+  //WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  //WiFi.setAutoReconnect(true);
   WiFi.setHostname(sys_config.hostname);
-  WiFi.onEvent(WiFiEvent, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
-  WiFi.onEvent(WiFiEvent, WiFiEvent_t::ARDUINO_EVENT_WIFI_SCAN_DONE);
-  //WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
-  WiFi.scanNetworks(true, false, false, sys_config.scan_channel_time);
+  app_ct = 0;
+  best_channel = 0;
+  best_rssi = -200;
+  ap_list.clear();
+  WiFi.scanNetworks(true, false, false, sys_config.scan_channel_time, channel);
 }
 
 void handleCmd(String &cmd) {
@@ -404,8 +444,10 @@ void setup() {
   Serial0.begin(115200);
   #endif
   Debugprintln("Init");
+  esp_wifi_set_country_code("DE", false);
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   esp_reset_reason_t reset_reason = esp_reset_reason();
+  send_cause = reset_reason << 4 | wakeup_reason;
   //on reset
   if(wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
     Debugprintf("reset %d\r\n", reset_reason);
@@ -460,6 +502,12 @@ void setup() {
       pinMode(14, OUTPUT); 
       digitalWrite(14, HIGH);//use external antenna
     }
+    WiFi.onEvent(WiFiEvent, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_CONNECTED);
+    WiFi.onEvent(WiFiEvent, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
+    WiFi.onEvent(WiFiEvent, WiFiEvent_t::ARDUINO_EVENT_WIFI_SCAN_DONE);
+    mqttClient.setServer(sys_config.mqtt_server, sys_config.mqtt_server_port);
+    mqttClient.onConnect(onMqttConnect);
+    mqttClient.onPublish(onMqttPublish);
     startWifi();
   }
   if(uart_avail) {
@@ -470,12 +518,17 @@ void setup() {
 }
 
 uint32_t last_blink = 0;
+uint32_t last_send = 0;
 void loop() {
   uint32_t ti = millis();
 
   button.read();
   if(button.wasPressed()) {
+    Debugprintln("button pressed");
     button_wakeups++;
+    send_cause = 0x200;
+    startWifi();
+    /*
     if(WiFi.isConnected()) {
       wifi_start_time = millis();
       sendMqtt();
@@ -485,6 +538,7 @@ void loop() {
       wifi_start_time = millis();
       WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
     }
+    */
   }
 
   if((ti - last_blink) > 200) {
@@ -505,21 +559,28 @@ void loop() {
   }
 
   if(mqtt_queued && !mqtt_pkt_ids.size()) {
-    Debugprintln("mqtt fin");
+    Debugprintf("%d mqtt fin\r\n", millis() -wifi_start_time);
+    last_send = ti;
     mqtt_queued = false;
     button_wakeups = 0;
+    send_failed = false;
     mqttClient.disconnect();
     wifi_start_time = 0;
     if(!uart_avail) {
       goToSleep(sys_config.interval);
+    } else {
+      WiFi.disconnect();
+      WiFi.mode(WIFI_MODE_NULL);
     }
   }
 
   // wait max 10 sec until sleep and retry
   if(wifi_start_time && (ti - wifi_start_time) > WIFI_WAIT_TIME) {
     Debugprintln("send failed");
+    last_send = ti;
     wifi_start_time = 0;
     mqtt_queued = false; 
+    send_failed = true;
     if(!WiFi.isConnected()) {
       Debugprintln("wifi failed");
       wifi_failed_ct++;
@@ -531,7 +592,45 @@ void loop() {
       goToSleep(sys_config.retry);
     } else {
       mqttClient.disconnect();
+      WiFi.disconnect();
+      WiFi.mode(WIFI_MODE_NULL);
     }
+  }
+
+  if((ti - last_send) > (1000 * sys_config.interval)) {
+    Debugprintf("timer send while loading %d %d %d\r\n", ti, last_send, sys_config.interval);
+    last_send = ti;
+    send_cause = 0x400;
+    startWifi();
+    /*
+    if(WiFi.isConnected()) {
+      wifi_start_time = millis();
+      sendMqtt();
+    } else {
+      WiFi.disconnect();
+      delay(10);
+      wifi_start_time = millis();
+      WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
+    }
+    */
+  }
+
+  if(send_failed && ((ti - last_send) > (1000 * sys_config.retry))) {
+    Debugprintln("retry send while loading");
+    last_send = ti;
+    send_cause = 0x600;
+    startWifi();
+    /*
+    if(WiFi.isConnected()) {
+      wifi_start_time = millis();
+      sendMqtt();
+    } else {
+      WiFi.disconnect();
+      delay(10);
+      wifi_start_time = millis();
+      WiFi.begin(sys_config.ssid, sys_config.wifi_pw);
+    }
+    */
   }
 
   if(uart_avail) {
